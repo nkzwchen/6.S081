@@ -37,8 +37,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  //char *mem;
-
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
@@ -48,15 +46,17 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     *pte = MASK_W(*pte);
     flags = PTE_FLAGS(*pte);
     if((*pte & PTE_C) == 0){
+     	if(getref((void *)pa) != 0)
+          panic("uvmcopy:don't clear");
     	*pte = *pte | PTE_C;
-    	PAGEREF[pa/PGSIZE]++;
+    	addref((void *)pa);
     }
-    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){
-	goto err;
+   if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){
+      goto err;
     }
     pte = walk(new, i, 0);
     *pte = *pte | PTE_C;
-    PAGEREF[pa/PGSIZE]++;
+    addref((void *)pa);
    }
   return 0;
 
@@ -86,8 +86,14 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
       panic("uvmunmap: not a leaf");
     if(do_free){
       uint64 pa = PTE2PA(*pte);
-      if ((*pte & PTE_C) == 0 || --PAGEREF[pa/PGSIZE] == 0){
-      	    kfree((void*)pa);
+      if ((*pte & PTE_C) != 0){
+        if (minref((void *)pa) == 0)
+          kfree((void*)pa);
+      }
+      else{
+          if(getref((void*)pa) != 0)
+            panic("uvmunmap : not clear");
+      	  kfree((void*)pa);
       }
     }
     *pte = 0;
@@ -111,7 +117,9 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     if (pte == 0)
     	return -1;
 
-    if((*pte & PTE_W) == 0 && (*pte & PTE_C) != 0){
+    if((*pte & PTE_C) != 0){
+        if((*pte & PTE_W) != 0)
+        	panic("copyout : not clear"); 
         uint flags = PTE_FLAGS(*pte)|PTE_W;
         uint64 pa = PTE2PA(*pte);
         char* mem = kalloc();
@@ -123,11 +131,10 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
   		kfree(mem);
   		return  -1;
   	}
-  	else if(--PAGEREF[pa/PGSIZE] == 0){
+  	else if(minref((void *)pa) == 0){
   		kfree((char *)pa);
   	}	
     }
-    
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
        return -1;
@@ -183,10 +190,11 @@ usertrap(void)
   	struct proc* p = myproc();
 	pte_t *pte;
   	uint64 va0 = PGROUNDDOWN(r_stval());
-  	if((pte = walk(p->pagetable, va0, 0)) != 0 && ((*pte & PTE_W) == 0) && (*pte & PTE_C) != 0){
+  	if((pte = walk(p->pagetable, va0, 0)) != 0 &&  (*pte & PTE_C) != 0){
+  		if((*pte & PTE_W) != 0)
+  		  panic("usertrap : not clear");
   		char* mem;
   		if((mem = kalloc()) !=  0){
-  			
   			if(va0 <= MAXVA - PGSIZE){
   				uint64 pa = PTE2PA(*pte);
   				uint flags = PTE_FLAGS(*pte) | PTE_W;
@@ -196,8 +204,8 @@ usertrap(void)
   					kfree(mem);
   					p->killed = 1;
   				}
-  				else if(--PAGEREF[pa/PGSIZE] == 0){
-  				      kfree((char *)pa);
+  				else if(minref((void *)pa) == 0){
+  				    kfree((char *)pa);
   				}	
   			}
 
@@ -227,12 +235,49 @@ usertrap(void)
 
   usertrapret();
 }
-
 ```
 
 ```c
 //kalloc.c
 int PAGEREF[(uint64)PHYSTOP/PGSIZE + 1]={0};
+int
+getref(void* pa){
+  int  ref;
+  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP){
+    printf("%p\n", pa);
+    panic("getref");
+  }
+  acquire(&kmem.lock);
+  if ((ref = PGREF[(uint64)pa/PGSIZE]) < 0)
+    panic("getref : overflow");
+  release(&kmem.lock);
+  return ref;
+}
+void
+addref(void* pa){
+  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP){
+    printf("%p\n", pa);
+    panic("addref");
+  }
+  acquire(&kmem.lock);
+  if (PGREF[(uint64)pa/PGSIZE]++ < 0)
+    panic("addref : overflow");
+  release(&kmem.lock);
+}
+int
+minref(void* pa){
+  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP){
+    printf("%p\n", pa);
+    panic("minref");
+  }
+  int ref;
+  acquire(&kmem.lock);
+  if (--PGREF[(uint64)pa/PGSIZE] < 0)
+    panic("minus : ref : overflow");
+  ref = PGREF[(uint64)pa/PGSIZE];
+  release(&kmem.lock);
+  return ref;
+}
 ```
 
 ```c
